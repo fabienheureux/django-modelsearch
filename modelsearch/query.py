@@ -67,6 +67,73 @@ class Fuzzy(SearchQuery):
         return f"<Fuzzy {repr(self.query_string)} operator={repr(self.operator)}>"
 
 
+class Semantic(SearchQuery):
+    """A semantic (vector) search query.
+
+    Generates an embedding for the query string and finds results
+    whose stored embeddings are most similar (cosine similarity).
+
+    Args:
+        query_string: The text to search for semantically.
+        threshold: Minimum cosine similarity (0.0 to 1.0) for a result
+            to be included. Defaults to the backend's configured threshold.
+        unaccent: If True, normalize accents before generating the embedding.
+    """
+
+    def __init__(
+        self,
+        query_string: str,
+        threshold: float | None = None,
+        unaccent: bool = False,
+    ):
+        self.query_string = query_string
+        self.threshold = threshold
+        self.unaccent = unaccent
+
+    def __repr__(self):
+        return f"<Semantic {repr(self.query_string)} threshold={self.threshold}>"
+
+
+class Hybrid(SearchQuery):
+    """A hybrid search query combining fuzzy and semantic search.
+
+    Runs both fuzzy (trigram) and semantic (vector) search, then combines
+    the scores using the configured weights. This gives the best of both
+    worlds: exact/near-exact matches from fuzzy search, and conceptually
+    similar results from semantic search.
+
+    Args:
+        query_string: The text to search for.
+        fuzzy_weight: Weight for the fuzzy (trigram) score in the combined
+            score. Defaults to 0.5.
+        semantic_weight: Weight for the semantic (vector) score in the
+            combined score. Defaults to 0.5.
+        unaccent: If True, normalize accents for fuzzy matching.
+        semantic_threshold: Minimum cosine similarity for semantic results.
+    """
+
+    def __init__(
+        self,
+        query_string: str,
+        fuzzy_weight: float = 0.5,
+        semantic_weight: float = 0.5,
+        unaccent: bool = False,
+        semantic_threshold: float | None = None,
+    ):
+        self.query_string = query_string
+        self.fuzzy_weight = fuzzy_weight
+        self.semantic_weight = semantic_weight
+        self.unaccent = unaccent
+        self.semantic_threshold = semantic_threshold
+
+    def __repr__(self):
+        return (
+            f"<Hybrid {repr(self.query_string)} "
+            f"fuzzy_weight={self.fuzzy_weight} "
+            f"semantic_weight={self.semantic_weight}>"
+        )
+
+
 class MatchAll(SearchQuery):
     def __repr__(self):
         return "<MatchAll>"

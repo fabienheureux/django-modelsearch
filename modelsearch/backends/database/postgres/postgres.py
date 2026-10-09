@@ -38,8 +38,26 @@ from django.utils.functional import cached_property
 
 from modelsearch.conf import get_app_config
 
-from ....index import AutocompleteField, RelatedFields, SearchField, get_indexed_models
-from ....query import And, Boost, Fuzzy, MatchAll, Not, Or, Phrase, PlainText
+from ....embeddings import get_embedding_provider
+from ....index import (
+    AutocompleteField,
+    RelatedFields,
+    SearchField,
+    SemanticField,
+    get_indexed_models,
+)
+from ....query import (
+    And,
+    Boost,
+    Fuzzy,
+    Hybrid,
+    MatchAll,
+    Not,
+    Or,
+    Phrase,
+    PlainText,
+    Semantic,
+)
 from ....utils import (
     ADD,
     MUL,
@@ -63,6 +81,10 @@ EMPTY_VECTOR = SearchVector(Value("", output_field=TextField()))
 DEFAULT_FUZZY_SIMILARITY_THRESHOLD = 0.3
 DEFAULT_FUZZY_PREFIX_BOOST = 0.0  # Multiplier bonus when field starts with query
 DEFAULT_FUZZY_ALGORITHM = "trigram"  # "trigram" or "levenshtein"
+DEFAULT_SEMANTIC_SIMILARITY_THRESHOLD = 0.5  # Minimum cosine similarity for semantic results
+DEFAULT_SEMANTIC_ENABLED = False  # Whether semantic search is enabled by default
+DEFAULT_HYBRID_FUZZY_WEIGHT = 0.5  # Weight for fuzzy score in hybrid search
+DEFAULT_HYBRID_SEMANTIC_WEIGHT = 0.5  # Weight for semantic score in hybrid search
 
 
 class FUnaccent(Func):
@@ -150,6 +172,7 @@ class ObjectIndexer:
         self.search_fields = obj.get_search_fields()
         self.config = backend.config
         self.autocomplete_config = backend.autocomplete_config
+        self.semantic_enabled = getattr(backend, "semantic_enabled", False)
 
     def prepare_value(self, value):
         if isinstance(value, str):
@@ -174,6 +197,14 @@ class ObjectIndexer:
         elif isinstance(field, AutocompleteField):
             # AutocompleteField does not define a boost parameter, so use a base weight of 'D'
             yield (field, "D", self.prepare_value(field.get_value(obj)))
+
+        elif isinstance(field, SemanticField):
+            # SemanticField: yield the value for embedding generation
+            yield (
+                field,
+                field.boost,
+                self.prepare_value(field.get_value(obj)),
+            )
 
         elif isinstance(field, RelatedFields):
             sub_obj = field.get_value(obj)
@@ -302,6 +333,51 @@ class ObjectIndexer:
                         texts.append(text)
         return " ".join(texts)
 
+    @cached_property
+    def semantic_text(self):
+        """
+        Combined plain text from all SemanticFields, used to generate
+        the embedding vector. Returns empty string if no SemanticFields
+        are defined or semantic search is disabled.
+        """
+        if not self.semantic_enabled:
+            return ""
+
+        texts = []
+        for field in self.search_fields:
+            for current_field, _boost, value in self.prepare_field(self.obj, field):
+                if isinstance(current_field, SemanticField):
+                    text = value.strip()
+                    if text:
+                        texts.append(text)
+        return " ".join(texts)
+
+    @cached_property
+    def embedding(self):
+        """
+        Generate the embedding vector for this object's semantic text.
+
+        Returns None if semantic search is disabled, no SemanticFields
+        are defined, or the semantic text is empty.
+        """
+        if not self.semantic_enabled:
+            return None
+
+        text = self.semantic_text
+        if not text:
+            return None
+
+        try:
+            provider = get_embedding_provider()
+            return provider.embed_text(text)
+        except Exception:
+            import logging
+
+            logging.getLogger(__name__).exception(
+                "Failed to generate embedding for %r", self.obj
+            )
+            return None
+
 
 class PostgresIndex(BaseIndex):
     def __init__(self, backend):
@@ -419,9 +495,20 @@ class PostgresIndex(BaseIndex):
             data_params.append(indexer.title_text)
             data_params.append(indexer.body_text)
 
+            # Embedding values for semantic search
+            # Use psycopg's Jsonb adapter to properly serialize the embedding
+            # list as JSONB (avoids psycopg interpreting it as a PostgreSQL array)
+            from psycopg.types.json import Jsonb
+
+            embedding_value = (
+                Jsonb(indexer.embedding) if indexer.embedding is not None else None
+            )
+            data_params.append(embedding_value)
+            data_params.append(indexer.semantic_text)
+
         data_sql = ", ".join(
             [
-                f"(%s, %s, {a}, {b}, {c}, 1.0, %s, %s)"
+                f"(%s, %s, {a}, {b}, {c}, 1.0, %s, %s, %s, %s)"
                 for a, b, c in zip(title_sql, autocomplete_sql, body_sql, strict=True)
             ]
         )
@@ -429,7 +516,7 @@ class PostgresIndex(BaseIndex):
         with self.write_connection.cursor() as cursor:
             cursor.execute(
                 f"""
-                INSERT INTO {IndexEntry._meta.db_table} (content_type_id, object_id, title, autocomplete, body, title_norm, title_text, body_text)
+                INSERT INTO {IndexEntry._meta.db_table} (content_type_id, object_id, title, autocomplete, body, title_norm, title_text, body_text, embedding, embedding_text)
                 (VALUES {data_sql})
                 ON CONFLICT (content_type_id, object_id)
                 DO UPDATE SET title = EXCLUDED.title,
@@ -437,7 +524,9 @@ class PostgresIndex(BaseIndex):
                               autocomplete = EXCLUDED.autocomplete,
                               body = EXCLUDED.body,
                               title_text = EXCLUDED.title_text,
-                              body_text = EXCLUDED.body_text
+                              body_text = EXCLUDED.body_text,
+                              embedding = EXCLUDED.embedding,
+                              embedding_text = EXCLUDED.embedding_text
                 """,
                 data_params,
             )
@@ -776,6 +865,193 @@ class PostgresSearchQueryCompiler(BaseSearchQueryCompiler):
 
         return queryset, F("_fuzzy_similarity")
 
+    def _get_query_embedding(self, query_string: str, unaccent: bool = False):
+        """Generate an embedding vector for the search query.
+
+        Returns None if embedding generation fails.
+        """
+        try:
+            provider = get_embedding_provider()
+            text = query_string
+            if unaccent:
+                # Normalize accents for consistency with indexed embeddings
+                import unicodedata
+
+                text = "".join(
+                    c
+                    for c in unicodedata.normalize("NFD", text)
+                    if unicodedata.category(c) != "Mn"
+                )
+            return provider.embed_text(text)
+        except Exception:
+            import logging
+
+            logging.getLogger(__name__).exception(
+                "Failed to generate query embedding for %r", query_string
+            )
+            return None
+
+    def _get_semantic_scores(
+        self, query_embedding: list[float], threshold: float
+    ) -> dict[str, float]:
+        """Compute cosine similarity scores for all indexed objects with embeddings.
+
+        Returns a dict mapping object_id (as string) to similarity score.
+        Only includes entries with similarity >= threshold.
+
+        Note: This fetches all embeddings into memory. For large datasets,
+        consider using pgvector or computing similarity in SQL.
+        """
+        from ....embeddings import cosine_similarity
+
+        # Get content type IDs for this model and its descendants
+        content_type_pks = get_descendants_content_types_pks(self.queryset.model)
+
+        # Fetch all index entries with embeddings for these content types
+        entries = IndexEntry._default_manager.filter(
+            content_type_id__in=content_type_pks,
+            embedding__isnull=False,
+        ).values_list("object_id", "embedding")
+
+        scores = {}
+        for object_id, embedding in entries:
+            if embedding is None:
+                continue
+            similarity = cosine_similarity(query_embedding, embedding)
+            if similarity >= threshold:
+                scores[str(object_id)] = similarity
+
+        return scores
+
+    def _build_semantic_queryset(self, config, backend):
+        """Build a queryset for pure semantic (vector) search.
+
+        Generates an embedding for the query and finds results with
+        the highest cosine similarity to stored embeddings.
+        """
+        query_string = self.query.query_string
+        use_unaccent = getattr(self.query, "unaccent", False)
+        threshold = self.query.threshold or backend.semantic_similarity_threshold
+
+        # Generate query embedding
+        query_embedding = self._get_query_embedding(query_string, unaccent=use_unaccent)
+        if query_embedding is None:
+            # Fall back to empty results if embedding generation fails
+            return self.queryset.none(), F("pk")
+
+        # Compute semantic scores for all indexed objects
+        scores = self._get_semantic_scores(query_embedding, threshold)
+
+        if not scores:
+            return self.queryset.none(), F("pk")
+
+        # Filter queryset to matching objects and annotate with scores
+        # We need to match by pk, converting string object_ids back to the pk type
+        matching_pks = list(scores.keys())
+
+        # Build a Case/When expression for scoring
+        from django.db.models import Case, FloatField, When
+
+        score_cases = [
+            When(pk=pk, then=Value(score)) for pk, score in scores.items()
+        ]
+        score_expression = Case(
+            *score_cases,
+            default=Value(0.0),
+            output_field=FloatField(),
+        )
+
+        queryset = (
+            self.queryset.filter(pk__in=matching_pks).annotate(
+                _semantic_similarity=score_expression,
+            )
+        )
+
+        return queryset, F("_semantic_similarity")
+
+    def _build_hybrid_queryset(self, config, backend):
+        """Build a queryset for hybrid search (fuzzy + semantic combined).
+
+        Runs both fuzzy (trigram) and semantic (vector) search, then
+        combines the scores using the configured weights.
+
+        The combined score is:
+            fuzzy_weight * fuzzy_score + semantic_weight * semantic_score
+
+        Results must pass at least one of the two thresholds.
+        """
+        query_string = self.query.query_string
+        use_unaccent = getattr(self.query, "unaccent", False)
+        fuzzy_weight = self.query.fuzzy_weight
+        semantic_weight = self.query.semantic_weight
+        semantic_threshold = (
+            self.query.semantic_threshold or backend.semantic_similarity_threshold
+        )
+
+        # Build fuzzy queryset (without slicing)
+        fuzzy_qs, fuzzy_rank = self._build_fuzzy_queryset(config, backend)
+
+        # Generate query embedding and compute semantic scores
+        query_embedding = self._get_query_embedding(query_string, unaccent=use_unaccent)
+
+        if query_embedding is not None:
+            semantic_scores = self._get_semantic_scores(
+                query_embedding, semantic_threshold
+            )
+        else:
+            semantic_scores = {}
+
+        # Get the set of IDs that match either fuzzy or semantic
+        fuzzy_ids = {str(pk) for pk in fuzzy_qs.values_list("pk", flat=True)}
+        semantic_ids = set(semantic_scores.keys())
+        matching_ids = fuzzy_ids | semantic_ids
+
+        if not matching_ids:
+            return self.queryset.none(), F("pk")
+
+        # Build combined queryset
+        from django.db.models import Case, FloatField, When
+
+        # Fuzzy score cases
+        fuzzy_score_cases = []
+        for obj in fuzzy_qs:
+            fuzzy_score_cases.append(
+                When(pk=obj.pk, then=Value(getattr(obj, "_fuzzy_similarity", 0.0)))
+            )
+
+        # Semantic score cases
+        semantic_score_cases = [
+            When(pk=pk, then=Value(score)) for pk, score in semantic_scores.items()
+        ]
+
+        # Combined: fuzzy_weight * fuzzy + semantic_weight * semantic
+        fuzzy_score_expr = Case(
+            *fuzzy_score_cases,
+            default=Value(0.0),
+            output_field=FloatField(),
+        )
+        semantic_score_expr = Case(
+            *semantic_score_cases,
+            default=Value(0.0),
+            output_field=FloatField(),
+        )
+
+        combined_score = (
+            fuzzy_score_expr * Value(fuzzy_weight)
+            + semantic_score_expr * Value(semantic_weight)
+        )
+
+        queryset = (
+            self.queryset.filter(pk__in=list(matching_ids))
+            .annotate(
+                _fuzzy_similarity=fuzzy_score_expr,
+                _semantic_similarity=semantic_score_expr,
+                _hybrid_score=combined_score,
+            )
+        )
+
+        return queryset, F("_hybrid_score")
+
     def search(self, config, start, stop, score_field=None, backend=None):
         # TODO: Handle MatchAll nested inside other search query classes.
         if isinstance(self.query, MatchAll):
@@ -786,6 +1062,18 @@ class PostgresSearchQueryCompiler(BaseSearchQueryCompiler):
 
         elif isinstance(self.query, Fuzzy):
             queryset, rank_expression = self._build_fuzzy_queryset(config, backend)
+            return self._apply_ordering_and_scoring(
+                queryset, rank_expression, start, stop, score_field
+            )
+
+        elif isinstance(self.query, Semantic):
+            queryset, rank_expression = self._build_semantic_queryset(config, backend)
+            return self._apply_ordering_and_scoring(
+                queryset, rank_expression, start, stop, score_field
+            )
+
+        elif isinstance(self.query, Hybrid):
+            queryset, rank_expression = self._build_hybrid_queryset(config, backend)
             return self._apply_ordering_and_scoring(
                 queryset, rank_expression, start, stop, score_field
             )
@@ -978,6 +1266,24 @@ class PostgresSearchBackend(BaseSearchBackend):
 
         # Fuzzy search algorithm: "trigram" (pg_trgm) or "levenshtein" (fuzzystrmatch)
         self.fuzzy_algorithm = params.get("FUZZY_ALGORITHM", DEFAULT_FUZZY_ALGORITHM)
+
+        # Semantic search: whether to generate and store embeddings
+        # Enable with SEMANTIC_ENABLED=True in the backend params
+        self.semantic_enabled = params.get("SEMANTIC_ENABLED", DEFAULT_SEMANTIC_ENABLED)
+
+        # Semantic search similarity threshold (0.0 to 1.0)
+        # Minimum cosine similarity for a result to be included in semantic search
+        self.semantic_similarity_threshold = params.get(
+            "SEMANTIC_SIMILARITY_THRESHOLD", DEFAULT_SEMANTIC_SIMILARITY_THRESHOLD
+        )
+
+        # Hybrid search weights (used when combining fuzzy + semantic scores)
+        self.hybrid_fuzzy_weight = params.get(
+            "HYBRID_FUZZY_WEIGHT", DEFAULT_HYBRID_FUZZY_WEIGHT
+        )
+        self.hybrid_semantic_weight = params.get(
+            "HYBRID_SEMANTIC_WEIGHT", DEFAULT_HYBRID_SEMANTIC_WEIGHT
+        )
 
         if params.get("ATOMIC_REBUILD", True):
             self.rebuilder_class = self.atomic_rebuilder_class

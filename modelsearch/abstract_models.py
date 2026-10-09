@@ -101,6 +101,11 @@ if connection.vendor == "postgresql":
         # Plain text mirrors for trigram/fuzzy search
         title_text = TextField(default="")
         body_text = TextField(default="")
+        # Embedding vector for semantic search (stored as JSON array of floats)
+        # Null when the model has no SemanticField or embedding generation is disabled
+        embedding = models.JSONField(null=True, blank=True, default=None)
+        # Plain text used to generate the embedding (for debugging/re-embedding)
+        embedding_text = TextField(default="", blank=True)
 
         class Meta(BaseIndexEntry.Meta):
             abstract = True

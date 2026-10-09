@@ -377,6 +377,35 @@ class FilterField(BaseField):
     pass
 
 
+class SemanticField(BaseField):
+    """A field that is indexed for semantic (vector) search.
+
+    Unlike :class:`SearchField` which uses full-text/trigram search,
+    a ``SemanticField`` generates an embedding vector for the field's
+    content and stores it in the index. Semantic search then compares
+    the query embedding against these stored embeddings using cosine
+    similarity.
+
+    Usage::
+
+        class MyModel(index.Indexed, models.Model):
+            name = models.CharField(max_length=200)
+            description = models.TextField()
+
+            search_fields = [
+                index.SearchField("name"),
+                index.SemanticField("description"),
+            ]
+
+    The embedding is generated at index time using the configured
+    embedding provider (see :mod:`modelsearch.embeddings`).
+    """
+
+    def __init__(self, field_name, boost=None, **kwargs):
+        super().__init__(field_name, **kwargs)
+        self.boost = boost or 1.0
+
+
 class RelatedFields:
     def __init__(self, field_name, fields):
         self.field_name = field_name
