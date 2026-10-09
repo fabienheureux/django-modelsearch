@@ -158,7 +158,12 @@ class SentenceTransformersProvider(BaseEmbeddingProvider):
                     "Install it with: pip install sentence-transformers"
                 ) from e
             self._model = SentenceTransformer(self.model_name)
-            self.dimensions = self._model.get_sentence_embedding_dimension()
+            # Use get_embedding_dimension() (newer API) with fallback to
+            # get_sentence_embedding_dimension() for older versions
+            if hasattr(self._model, "get_embedding_dimension"):
+                self.dimensions = self._model.get_embedding_dimension()
+            else:
+                self.dimensions = self._model.get_sentence_embedding_dimension()
         return self._model
 
     def embed_texts(self, texts: Sequence[str]) -> list[list[float]]:
